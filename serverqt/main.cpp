@@ -1,0 +1,423 @@
+﻿#include <stdio.h>
+#include <stdlib.h>   
+#include <string.h> 
+#include <stdint.h>   //uint8
+#include <errno.h>  
+#include <fcntl.h>   
+#include <mysql/mysql.h> 
+#include <sys/socket.h> 
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <inttypes.h>
+#include <sys/epoll.h>
+
+//常量定义
+#define MAX_EVENTS 1024 //epoll一次最多处理的事件数
+#define MAX_CLIENTS 100 //最大客户端连接数
+#define BUFFER_SIZE 2048 //通用缓存区大小
+#define MY_PROTOCOOL_VERSION 1 //当前协议版本
+
+//消息类型
+#define MSG_TYPE_TEXT 1 //文本消息
+#define MSG_TYPE_FILE 2 //文件消息
+
+//协议包头
+typedef struct {
+    uint8_t  version;
+    uint8_t  msg_type;
+    uint32_t datalen;
+    uint32_t filename_len;
+    uint64_t file_size;
+} __attribute__((packed)) PacketHeader;
+
+//客户端连接信息
+typedef struct {
+    int socket;
+    int id;
+    char current_filename[BUFFER_SIZE];
+    int file_fd;
+    uint64_t received_size;
+} Client;
+
+//网络字节序
+uint64_t htonll(uint64_t value) {
+    return ((uint64_t)htonl((uint32_t)(value >> 32)) << 32) | htonl((uint32_t)value);
+}
+//主机字节序
+uint64_t ntohll(uint64_t value) {
+    return ((uint64_t)ntohl((uint32_t)(value >> 32)) << 32) | ntohl((uint32_t)value);
+}
+
+//错误处理函数
+void error_exit(const char* msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+//设置文件为非阻塞模式 
+void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL); //F_GETFL获取文件标识符
+    if (flags == -1) error_exit("fcntl(F_GETFL)");
+    flags |= O_NONBLOCK; //设置非阻塞 异步
+    if (fcntl(fd, F_SETFL, flags) == -1) error_exit("fcntl(F_SETFL)");//F_SETFL 设置文件标识符
+}
+
+// 生成唯一ID并插入客户端信息（带事务保护）
+bool insert_client_with_id(MYSQL* conn, const char* ip, int port, int* client_id) {
+    char escaped_ip[BUFFER_SIZE] = { 0 };
+    // 转义 IP 地址
+    mysql_real_escape_string(conn, escaped_ip, ip, strlen(ip));
+
+    // 开启事务
+    if (mysql_query(conn, "START TRANSACTION") != 0) {
+        fprintf(stderr, "开启事务失败: %s\n", mysql_error(conn));
+        return false;
+    }
+
+    // 构建并执行插入语句
+    char query[BUFFER_SIZE] = { 0 };
+    snprintf(query, sizeof(query), "INSERT INTO clients (ip, port) VALUES ('%s', %d)", escaped_ip, port);
+    if (mysql_query(conn, query) != 0) {
+        fprintf(stderr, "插入失败: %s\n", mysql_error(conn));
+        if (mysql_query(conn, "ROLLBACK") != 0) {
+            fprintf(stderr, "回滚失败: %s\n", mysql_error(conn));
+        }
+        return false;
+    }
+
+    // 获取数据库自动生成的自增 ID
+    *client_id = mysql_insert_id(conn);
+
+    // 提交事务
+    if (mysql_query(conn, "COMMIT") != 0) {
+        fprintf(stderr, "提交事务失败: %s\n", mysql_error(conn));
+        return false;
+    }
+
+    return true;
+}
+
+// 广播消息给所有客户端（包括发送者）
+void broadcast_message(Client clients[], int sender_fd, const void* data, size_t len,
+    uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].socket != -1) {//连接成功
+            PacketHeader header = {
+                .version = MY_PROTOCOOL_VERSION,
+                .msg_type = msg_type,
+                .datalen = htonl(len),
+                .filename_len = htonl(filename_len),
+                .file_size = htonll(file_size)
+            };
+            //发送消息头部到客户端
+            if (send(clients[i].socket, &header, sizeof(header), MSG_NOSIGNAL) == -1) {//防止程序崩溃
+                //使用MSG_NOSIGNAL标志避免在客户端断开时产生SIGPIPE信号
+                fprintf(stderr, "Failed to send header to client %d (fd=%d): %s\n", i, clients[i].socket, strerror(errno));
+                continue;
+            }
+            //发送文件名到客户端
+            if (filename_len > 0) {
+                if (send(clients[i].socket, filename, filename_len, MSG_NOSIGNAL) == -1) {
+                    fprintf(stderr, "Failed to send filename to client %d (fd=%d): %s\n", i, clients[i].socket, strerror(errno));
+                    continue;
+                }
+            }
+            //发送实际数据到客户端
+            if (send(clients[i].socket, data, len, MSG_NOSIGNAL) == -1) {
+                fprintf(stderr, "Failed to send data to client %d (fd=%d): %s\n", i, clients[i].socket, strerror(errno));
+                continue;
+            }
+            //记录成功广播的消息信息
+            printf("Broadcasted message to client %d (fd=%d): type=%u, data_len=%zu", i, clients[i].socket, msg_type, len);
+            // 追加文件名和文件大小信息到日志
+            if (filename_len > 0) {
+                printf(", filename=\"%.*s\", file_size=%" PRIu64, filename_len, filename, file_size);
+            }
+
+
+            printf("\n");
+
+        }
+    }
+}
+
+//文本处理
+void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
+    char buffer[BUFFER_SIZE];
+    if (header.datalen >= BUFFER_SIZE) {
+        fprintf(stderr, "文本消息过长\n");
+        return;
+    }
+    ssize_t bytes_read = recv(client_fd, buffer, header.datalen, MSG_WAITALL);
+    //MSG_WAITALL 告诉系统尽可能等待，直到读取到指定数量的字节
+    if (bytes_read != header.datalen) {
+        fprintf(stderr, "文本消息接收不完整\n");
+        return;
+    }
+    buffer[bytes_read] = '\0';//添加结束符
+    //收到文本消息打印出来
+    printf("收到文本消息: %s\n", buffer);
+    broadcast_message(clients, client_fd, buffer, bytes_read, MSG_TYPE_TEXT, NULL, 0, 0);
+}
+
+//文件处理
+void handle_file_message(Client clients[], int client_fd, PacketHeader header) {
+    char filename[BUFFER_SIZE];
+    if (header.filename_len >= BUFFER_SIZE) {
+        fprintf(stderr, "文件名过长\n");
+        return;
+    }
+    ssize_t bytes_read = recv(client_fd, filename, header.filename_len, MSG_WAITALL);
+    if (bytes_read != header.filename_len) {
+        fprintf(stderr, "文件名接收不完整\n");
+        return;
+    }
+    filename[bytes_read] = '\0';
+    //动态分配文件数据内存
+    char* file_data = (char*)malloc(header.datalen);
+    if (!file_data) {
+        fprintf(stderr, "内存分配失败\n");
+        return;
+    }
+    bytes_read = recv(client_fd, file_data, header.datalen, MSG_WAITALL);
+    if (bytes_read != header.datalen) {
+        fprintf(stderr, "文件数据接收不完整\n");
+        free(file_data);
+        return;
+    }
+    //收到文件消息打印出来
+    printf("收到文件: %s (大小: %lu bytes)\n", filename, header.file_size);
+    broadcast_message(clients, client_fd, file_data, header.datalen, MSG_TYPE_FILE, 
+        filename, header.filename_len,header.file_size);
+    free(file_data);
+}
+
+
+int main() {
+    //创建mysql
+    MYSQL* conn = mysql_init(NULL);
+
+    if (!conn || !mysql_real_connect(conn, "127.0.0.1", "root", "1228", "server", 0, NULL, 0)) {
+        fprintf(stderr, "MySQL init/connect failed: %s\n", mysql_error(conn));
+        exit(EXIT_FAILURE);
+    }
+    //创建用于记录客户端 IP 和端口的表
+    if (mysql_query(conn, "DROP TABLE IF EXISTS clients") != 0) {
+        fprintf(stderr, "删除旧表失败: %s\n", mysql_error(conn));
+    }
+
+    // 创建新表（确保id字段自增）
+    if (mysql_query(conn,
+        "CREATE TABLE clients ("
+        "id INT AUTO_INCREMENT PRIMARY KEY, "
+        "ip VARCHAR(15) NOT NULL, "
+        "port INT NOT NULL)"
+    ) != 0) {
+        fprintf(stderr, "创建表失败: %s\n", mysql_error(conn));
+        mysql_close(conn);
+        exit(EXIT_FAILURE);
+    }
+
+    // 解析命令行参数获取端口号
+    int port = 8888; // 默认端口
+    char port_str[BUFFER_SIZE] = { 0 };
+    printf("请输入服务器端口号（默认8888，直接回车使用默认值）: ");
+    fflush(stdout);
+    if (fgets(port_str, sizeof(port_str), stdin)) {
+        char* newline = strchr(port_str, '\n');
+        if (newline) *newline = '\0';  // 去掉换行符
+
+        if (port_str[0] != '\0') {
+            int input_port = atoi(port_str);
+            if (input_port >= 0 && input_port <= 65535) {
+                port = input_port;
+            }
+            else {
+                fprintf(stderr, "错误：端口号必须在1024-65535之间，使用默认端口8888\n");
+            }
+        }
+    }
+    printf("服务器启动，监听端口 %d\n", port);
+    printf("输入 'exit' 退出服务器\n");
+
+    // 初始化客户端数组
+    Client clients[MAX_CLIENTS] = { 0 };
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        clients[i].socket = -1;//未连接
+        clients[i].id = 0;
+    }
+
+    // 创建监听Socket TCP
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) error_exit("socket创建失败");
+
+    // 设置端口复用
+    // 防止服务无法重启或并发性能受限的问题
+    int opt = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)//SO_REUSEADDR允许重用本地地址（IP + 端口）
+        error_exit("setsockopt失败");
+    struct sockaddr_in server_addr;//存储服务端的地址信息（IP + 端口）
+    memset(&server_addr, 0, sizeof(server_addr));//初始化为0
+    server_addr.sin_family = AF_INET;//ipv4
+    server_addr.sin_addr.s_addr = INADDR_ANY;//接受所有网卡上的ip地址
+    server_addr.sin_port = htons(port);//网络字节序（大端）port
+    if (bind(listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0)
+        error_exit("bind失败");
+    if (listen(listen_fd, MAX_CLIENTS) < 0)
+        error_exit("listen失败");
+    set_nonblocking(listen_fd);//非阻塞
+
+    // 初始化epoll
+    int epoll_fd = epoll_create1(0);//失败返回-1
+    if (epoll_fd < 0) error_exit("epoll_create失败");
+    //event：配置某个 fd 的监听事件
+    //events：保存 epoll_wait 返回的多个就绪事件
+    struct epoll_event event, events[MAX_EVENTS];
+    //监听服务器的 监听套接字 listen_fd
+    event.events = EPOLLIN | EPOLLET;//可读、边缘触发
+    event.data.fd = listen_fd;//监听socket
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) < 0)
+        error_exit("epoll_ctl添加监听socket失败");
+
+    // 添加标准输入到epoll监控（用于处理exit命令）
+    event.data.fd = STDIN_FILENO;//fd字段设置为标准输入的文件描述符
+    event.events = EPOLLIN | EPOLLET;//可读、边缘触发
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, STDIN_FILENO, &event) < 0)//监听event
+        error_exit("epoll_ctl添加标准输入失败");
+
+    char exit_cmd[BUFFER_SIZE] = { 0 };
+    int should_exit = 0;
+
+    while (!should_exit) {
+        int n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1); 
+        //用于等待 I/O 事件的发生,返回就绪事件的数量
+        if (n_events < 0) {
+            if (errno == EINTR) continue;
+            error_exit("epoll_wait失败");
+        }
+
+        for (int i = 0; i < n_events; i++) {
+            int fd = events[i].data.fd;
+
+            // 处理终端输入（退出命令）
+            if (fd == STDIN_FILENO) {
+                ssize_t read_size = read(STDIN_FILENO, exit_cmd, sizeof(exit_cmd));
+                if (read_size > 0 && strstr(exit_cmd, "exit\n") != NULL) {
+                    printf("接收到退出命令，关闭服务器\n");
+                    should_exit = 1; // 设置退出标志
+                    break; // 跳出事件循环，准备退出
+                }
+                memset(exit_cmd, 0, sizeof(exit_cmd)); // 清空缓冲区
+            }
+
+            // 处理新客户端连接
+            else if (fd == listen_fd) {
+                struct sockaddr_in client_addr;//存储客户端
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(listen_fd,
+                    (struct sockaddr*)&client_addr, &client_len);//接受并返回客户端socket描述符
+                if (client_fd < 0) {
+                    perror("accept失败");
+                    continue;
+                }
+
+                // 查找可用客户端槽位
+                int client_idx = -1;
+                for (int j = 0; j < MAX_CLIENTS; j++) {
+                    if (clients[j].socket == -1) {
+                        client_idx = j;
+                        break;
+                    }
+                }
+
+                if (client_idx == -1) {
+                    close(client_fd);
+                    fprintf(stderr, "客户端连接数达到上限（%d）\n", MAX_CLIENTS);
+                    continue;
+                }
+
+                set_nonblocking(client_fd);//非阻塞
+                char client_ip[INET_ADDRSTRLEN];//存储 IPv4 地址
+                //客户端的 IPv4地址（二进制形式） 转换为 字符串形式，并存入 client_ip 中
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                int client_port = ntohs(client_addr.sin_port);//转成主机字节序port
+
+                // 使用事务保护的方式插入客户端信息并获取ID
+                int new_id = 0;
+                if (insert_client_with_id(conn, client_ip, client_port, &new_id)) {
+                    printf("新客户端连接: ID=%d IP=%s Port=%d\n", new_id, client_ip, client_port);
+                    clients[client_idx].id = new_id; // 使用数据库生成的ID
+                }
+                else {
+                    printf("客户端ID生成失败，拒绝连接: IP=%s Port=%d\n", client_ip, client_port);
+                    close(client_fd);
+                    continue;
+                }
+                clients[client_idx].socket = client_fd;
+                clients[client_idx].received_size = 0;
+
+                // 添加到epoll监控
+                event.data.fd = client_fd;
+                event.events = EPOLLIN | EPOLLET;//可读、边缘触发
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+                    close(client_fd);
+                    clients[client_idx].socket = -1;
+                    error_exit("epoll_ctl添加客户端失败");
+                }
+            }
+
+            // 处理客户端数据
+            else {
+                int client_idx = -1;
+                for (int j = 0; j < MAX_CLIENTS; j++) {
+                    if (clients[j].socket == fd) {
+                        client_idx = j;
+                        break;
+                    }
+                }
+                if (client_idx == -1) { close(fd); continue; }
+
+                PacketHeader header = { 0 };
+                ssize_t recv_size = recv(fd, &header, sizeof(header), 0);
+                if (recv_size <= 0) {
+                    // 客户端断开连接
+                    printf("客户端%d断开连接（fd=%d）\n", client_idx + 1, fd);
+                    close(fd);
+                    clients[client_idx].socket = -1;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                    continue;
+                }
+
+                header.datalen = ntohl(header.datalen);
+                header.filename_len = ntohl(header.filename_len);
+                header.file_size = ntohll(header.file_size);
+
+                switch (header.msg_type) {
+                case MSG_TYPE_TEXT:
+                    handle_text_message(clients, fd, header);
+                    break;
+                case MSG_TYPE_FILE:
+                    handle_file_message(clients, fd, header);
+                    break;
+                default:
+                    fprintf(stderr, "未知消息类型: %d\n", header.msg_type);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 清理资源
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].socket != -1) {
+            close(clients[i].socket);
+            clients[i].socket = -1;
+        }
+    }
+    mysql_close(conn);
+    close(listen_fd);
+    close(epoll_fd);
+    printf("服务器已关闭\n");
+    return 0;
+}
