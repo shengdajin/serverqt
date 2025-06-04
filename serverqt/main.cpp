@@ -15,8 +15,10 @@
 //常量定义
 #define MAX_EVENTS 1024 //epoll一次最多处理的事件数
 #define MAX_CLIENTS 100 //最大客户端连接数
-#define BUFFER_SIZE 2048 //通用缓存区大小
+#define BUFFER_SIZE 4096 //通用缓存区大小
 #define MY_PROTOCOOL_VERSION 1 //当前协议版本
+#define MAX_FILENAME_LEN 256  //最大文件名长度
+
 
 //消息类型
 #define MSG_TYPE_TEXT 1 //文本消息
@@ -24,26 +26,38 @@
 
 //协议包头
 typedef struct {
-    uint8_t  version;
-    uint8_t  msg_type;
-    uint32_t datalen;
-    uint32_t filename_len;
-    uint64_t file_size;
-} __attribute__((packed)) PacketHeader;
+    uint8_t  version;//1字节
+    uint8_t  msg_type;//1字节
+	uint32_t datalen;//4字节
+	uint32_t filename_len;//4字节
+    uint64_t filesize;//8字节
+	uint64_t sSum;//8字节
+    uint32_t total_len;//4字节
+} PacketHeader;
+
+//为每个文件维护独立的接收状态
+typedef struct {
+    char filename[MAX_FILENAME_LEN];  // 文件名
+    int file_fd;                      // 文件描述符
+    size_t received_size;             // 已接收的文件数据大小
+    uint64_t filesize;                // 文件总大小
+} FileContext;
 
 //客户端连接信息
 typedef struct {
     int socket;
     int id;
-    char current_filename[BUFFER_SIZE];
-    int file_fd;
-    uint64_t received_size;
+    FileContext* file_contexts;  // 文件上下文列表（动态数组或链表）
 } Client;
+
+char sendbuffer[BUFFER_SIZE];
+char recvbuffer[BUFFER_SIZE];
 
 //网络字节序
 uint64_t htonll(uint64_t value) {
     return ((uint64_t)htonl((uint32_t)(value >> 32)) << 32) | htonl((uint32_t)value);
 }
+
 //主机字节序
 uint64_t ntohll(uint64_t value) {
     return ((uint64_t)ntohl((uint32_t)(value >> 32)) << 32) | ntohl((uint32_t)value);
@@ -98,9 +112,41 @@ bool insert_client_with_id(MYSQL* conn, const char* ip, int port, int* client_id
     return true;
 }
 
-// 广播消息给所有客户端（包括发送者）
-void broadcast_message(Client clients[], int sender_fd, const void* data, size_t len,
-    uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size) {
+// 计算校验和
+uint64_t calculate_checksum(const char* data, size_t len) {
+    uint64_t sum = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        sum += (uint8_t)data[i];  // 将每个字节转换为无符号8位整数并累加
+    }
+
+    return sum;
+}
+
+//文本处理
+void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
+    //uint32_t len = header.filename_len;
+    char buffer[BUFFER_SIZE];
+    if (header.datalen >= BUFFER_SIZE) {
+        fprintf(stderr, "文本消息过长\n");
+        return;
+    }
+    ssize_t bytes_read = recv(client_fd, buffer, header.datalen, MSG_WAITALL);
+    //MSG_WAITALL 告诉系统尽可能等待，直到读取到指定数量的字节
+    if (bytes_read != header.datalen) {
+        fprintf(stderr, "文本消息接收不完整\n");
+        return;
+    }
+    buffer[bytes_read] = '\0';//添加结束符
+    //收到文本消息打印出来
+    printf("收到文本消息: %s\n", buffer);
+    broadcast_text_message(clients, client_fd, buffer, bytes_read, MSG_TYPE_TEXT, NULL, 0, 0);
+}
+
+//文本广播发送
+void broadcast_text_message(Client clients[], int sender_fd, const void* data, size_t len,
+    uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size,
+    uint64_t offset, uint64_t total_size) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].socket != -1) {//连接成功
             PacketHeader header = {
@@ -142,58 +188,251 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
     }
 }
 
-//文本处理
-void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
-    char buffer[BUFFER_SIZE];
-    if (header.datalen >= BUFFER_SIZE) {
-        fprintf(stderr, "文本消息过长\n");
-        return;
-    }
-    ssize_t bytes_read = recv(client_fd, buffer, header.datalen, MSG_WAITALL);
-    //MSG_WAITALL 告诉系统尽可能等待，直到读取到指定数量的字节
-    if (bytes_read != header.datalen) {
-        fprintf(stderr, "文本消息接收不完整\n");
-        return;
-    }
-    buffer[bytes_read] = '\0';//添加结束符
-    //收到文本消息打印出来
-    printf("收到文本消息: %s\n", buffer);
-    broadcast_message(clients, client_fd, buffer, bytes_read, MSG_TYPE_TEXT, NULL, 0, 0);
-}
-
 //文件处理
 void handle_file_message(Client clients[], int client_fd, PacketHeader header) {
-    char filename[BUFFER_SIZE];
-    if (header.filename_len >= BUFFER_SIZE) {
+    // 重置校验和（避免多次调用导致残留）
+    uint64_t received_checksum = 0;
+
+    // 处理包头
+    const unsigned char* header_bytes = (const unsigned char*)&header;
+    for (size_t i = 0; i < sizeof(PacketHeader); i++) {
+        received_checksum += header_bytes[i];
+    }
+    // 当文件名超过最大文件长度
+    if (header.filename_len >= MAX_FILENAME_LEN) {
         fprintf(stderr, "文件名过长\n");
         return;
     }
+
+    // 给文件名分配空间(暂存文件名）
+    char filename[MAX_FILENAME_LEN];
+
+    // 接收文件名
     ssize_t bytes_read = recv(client_fd, filename, header.filename_len, MSG_WAITALL);
     if (bytes_read != header.filename_len) {
         fprintf(stderr, "文件名接收不完整\n");
         return;
     }
-    filename[bytes_read] = '\0';
-    //动态分配文件数据内存
-    char* file_data = (char*)malloc(header.datalen);
-    if (!file_data) {
-        fprintf(stderr, "内存分配失败\n");
-        return;
+
+    // 检查文件名是否与当前存储的相同
+    if (strcmp(client.current_filename, filename) == 0) {
+        // 文件名相同，跳过文件名处理
+        printf("文件名相同，跳过处理\n");
     }
-    bytes_read = recv(client_fd, file_data, header.datalen, MSG_WAITALL);
-    if (bytes_read != header.datalen) {
+    else {
+        // 文件名不同，更新当前文件名
+        strncpy(client.current_filename, filename, bytes_read);
+        client.current_filename[bytes_read] = '\0';
+        client.received_size += bytes_read;
+        filename[bytes_read] = '\0';
+        printf("更新文件名为: %s\n", filename);
+    }
+    for (ssize_t i = 0; i < bytes_read; i++) {
+        received_checksum += (unsigned char)filename[i];
+    }
+
+    // 动态分配文件数据内存
+    char file_data[BUFFER_SIZE];
+    ssize_t total_received = 0;
+    uint32_t totalfilesize = header.filesize;
+
+    while (total_received < totalfilesize) {
+
+        // 计算当前分块的大小
+        size_t current_chunk_size = (totalfilesize - total_received > BUFFER_SIZE) ?
+            BUFFER_SIZE : (totalfilesize - total_received);
+
+        // 接收当前分块的数据
+        ssize_t received = recv(
+            client_fd,
+            file_data,
+            current_chunk_size,
+            0
+        );
+
+        if (received <= 0) {
+            if (received == 0) {
+                fprintf(stderr, "连接关闭，文件数据未完全接收\n");
+            }
+            else {
+                perror("recv failed");
+            }
+            return;
+        }
+        // **计算接收到的数据的校验和**
+        //uint64_t chunk_checksum = calculate_checksum(data_chunk, chunk_size);
+        for (ssize_t i = 0; i < received; i++) {
+            received_checksum += (unsigned char)file_data[i];
+        }
+        // 广播当前分块的数据
+        broadcast_file_message(clients, client_fd, file_data, received,
+            MSG_TYPE_FILE, filename, header.filename_len,
+            header.filesize, total_received, header.filesize);
+
+        client.received_size += received;
+        total_received += received;
+    }
+    // **验证校验和是否匹配**
+    if (received_checksum != header.sSum) {
+        fprintf(stderr, "校验和错误！接收到的数据可能已损坏！\n");
+        fprintf(stderr, "期望校验和: %" PRIu64 ", 实际校验和: %" PRIu64 "\n",
+            header.sSum, received_checksum);
+        return;  // 校验失败，终止接收
+    }
+
+    // 检查是否完全接收
+    if (total_received != file_data_size) {
         fprintf(stderr, "文件数据接收不完整\n");
-        free(file_data);
         return;
     }
-    //收到文件消息打印出来
+
+    // 收到文件消息打印出来
     printf("收到文件: %s (大小: %lu bytes)\n", filename, header.file_size);
-    broadcast_message(clients, client_fd, file_data, header.datalen, MSG_TYPE_FILE, 
-        filename, header.filename_len,header.file_size);
-    free(file_data);
 }
 
+//文件广播发送
+void broadcast_file_message(Client clients[], int sender_fd, const void* data, size_t len,
+    uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size,
+    uint64_t offset, uint64_t total_size) {
+    // 计算整个消息的总长度（包头 + 文件名 + 数据）
+    uint32_t total_len = sizeof(PacketHeader) + filename_len + len;
 
+    // 如果文件较大（超过 BUFFER_SIZE），则分块发送数据
+    if (len > BUFFER_SIZE) {
+        // 1. 先发送包头和文件名
+        PacketHeader header = {
+            .version = MY_PROTOCOOL_VERSION,
+            .msg_type = msg_type,
+            .datalen = htonl(len),          // 数据长度（用于客户端知道要接收多少数据）
+            .filename_len = htonl(filename_len),
+            .filesize = htonl(file_size),
+            .sSum = htonll(calculate_checksum(data, len)),  // 校验和
+            .total_len = htonl(total_len)   // 整个消息的总长度（仅用于小文件）
+        };
+
+        // 发送包头
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].socket != -1) {
+                if (send(clients[i].socket, &header, sizeof(header), MSG_NOSIGNAL) == -1) {
+                    fprintf(stderr, "Failed to send header to client %d (fd=%d): %s\n",
+                        i, clients[i].socket, strerror(errno));
+                    continue;
+                }
+            }
+        }
+
+        // 发送文件名
+        if (filename_len > 0) {
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].socket != -1) {
+                    if (send(clients[i].socket, filename, filename_len, MSG_NOSIGNAL) == -1) {
+                        fprintf(stderr, "Failed to send filename to client %d (fd=%d): %s\n",
+                            i, clients[i].socket, strerror(errno));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 2. 分块发送数据
+        char buffer[BUFFER_SIZE];
+        size_t bytes_sent = 0;
+        while (bytes_sent < len) {
+            size_t current_chunk_size = (len - bytes_sent > BUFFER_SIZE) ? BUFFER_SIZE : (len - bytes_sent);
+            memcpy(buffer, (const char*)data + bytes_sent, current_chunk_size);
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].socket != -1) {
+                    if (send(clients[i].socket, buffer, current_chunk_size, MSG_NOSIGNAL) == -1) {
+                        fprintf(stderr, "Failed to send data chunk to client %d (fd=%d): %s\n",
+                            i, clients[i].socket, strerror(errno));
+                        continue;
+                    }
+                }
+            }
+
+            bytes_sent += current_chunk_size;
+        }
+
+        // 记录日志
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].socket != -1) {
+                printf("Broadcasted message to client %d (fd=%d): type=%u, data_len=%zu\n",
+                    i, clients[i].socket, msg_type, len);
+                if (filename_len > 0) {
+                    printf(", filename=\"%.*s\", file_size=%" PRIu64 "\n",
+                        filename_len, filename, file_size);
+                }
+                printf(", offset=%" PRIu64 ", total_size=%" PRIu64 ", checksum=%" PRIu64 "\n",
+                    offset, total_size, calculate_checksum(data, len));
+            }
+        }
+    }
+    // 小文件/文本消息：直接封装成完整消息一次性发送
+    else {
+        // 计算整个消息的总长度
+        uint32_t total_len = sizeof(PacketHeader) + filename_len + len;
+
+        // 分配缓冲区
+        char* buffer = malloc(total_len);
+        if (!buffer) {
+            perror("malloc failed");
+            return;
+        }
+
+        // 填充包头
+        PacketHeader header = {
+            .version = MY_PROTOCOOL_VERSION,
+            .msg_type = msg_type,
+            .datalen = htonl(len),
+            .filename_len = htonl(filename_len),
+            .filesize = htonl(file_size),
+            .sSum = htonll(calculate_checksum(data, len)),
+            .total_len = htonl(total_len)
+        };
+
+        // 复制包头到缓冲区
+        memcpy(buffer, &header, sizeof(PacketHeader));
+
+        // 复制文件名到缓冲区（如果存在）
+        if (filename_len > 0) {
+            memcpy(buffer + sizeof(PacketHeader), filename, filename_len);
+        }
+
+        // 复制数据到缓冲区
+        memcpy(buffer + sizeof(PacketHeader) + filename_len, data, len);
+
+        // 发送整个缓冲区
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].socket != -1) {
+                ssize_t sent = send(clients[i].socket, buffer, total_len, MSG_NOSIGNAL);
+                if (sent == -1) {
+                    fprintf(stderr, "Failed to send message to client %d (fd=%d): %s\n",
+                        i, clients[i].socket, strerror(errno));
+                }
+                else if (sent != total_len) {
+                    fprintf(stderr, "Partial send to client %d (fd=%d): expected %u, sent %zd\n",
+                        i, clients[i].socket, total_len, sent);
+                }
+                else {
+                    printf("Broadcasted message to client %d (fd=%d): type=%u, data_len=%zu\n",
+                        i, clients[i].socket, msg_type, len);
+                    if (filename_len > 0) {
+                        printf(", filename=\"%.*s\", file_size=%" PRIu64 "\n",
+                            filename_len, filename, file_size);
+                    }
+                    printf(", offset=%" PRIu64 ", total_size=%" PRIu64 ", checksum=%" PRIu64 "\n",
+                        offset, total_size, calculate_checksum(data, len));
+                }
+            }
+        }
+
+        // 释放缓冲区
+        free(buffer);
+    }
+}
+
+//主函数
 int main() {
     //创建mysql
     MYSQL* conn = mysql_init(NULL);

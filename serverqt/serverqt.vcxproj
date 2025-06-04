@@ -79,6 +79,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="serve.cpp" />
   </ItemGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
