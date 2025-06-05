@@ -18,7 +18,7 @@
 #define BUFFER_SIZE 4096 //通用缓存区大小
 #define MY_PROTOCOOL_VERSION 1 //当前协议版本
 #define MAX_FILENAME_LEN 256  //最大文件名长度
-
+#define MAX_PACKET_SIZE (sizeof(PacketHeader)+MAX_FILENAME_LEN+BUFFER_SIZE)
 
 //消息类型
 #define MSG_TYPE_TEXT 1 //文本消息
@@ -44,8 +44,8 @@ typedef struct {
 } Client;
 
 
-char sendbuffer[BUFFER_SIZE];
-char recvbuffer[BUFFER_SIZE];
+static char sendbuffer[MAX_PACKET_SIZE];
+static char recvbuffer[MAX_PACKET_SIZE];
 
 //网络字节序
 uint64_t htonll(uint64_t value) {
@@ -505,7 +505,7 @@ int main() {
                     continue;
                 }
 
-                header.datalen = ntohl(header.datalen);
+                header.data_len = ntohl(header.data_len);
                 header.filename_len = ntohl(header.filename_len);
                 header.file_size = ntohll(header.file_size);
 
@@ -514,7 +514,7 @@ int main() {
                     handle_text_message(clients, fd, header, headerchecksum);
                     break;
                 case MSG_TYPE_FILE:
-                    handle_file_message(clients, fd, header);
+                    handle_file_message(clients, fd, header, headerchecksum);
                     break;
                 default:
                     fprintf(stderr, "未知消息类型: %d\n", header.msg_type);
