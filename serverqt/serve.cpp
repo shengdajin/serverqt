@@ -28,9 +28,9 @@
 typedef struct {
     uint8_t  version;//1字节
     uint8_t  msg_type;//1字节
-    uint32_t datalen;//4字节
+	uint32_t datalen;//4字节 当前数据包数据长度
     uint32_t filename_len;//4字节
-    uint64_t filesize;//8字节
+    uint64_t filesize;//8字节 整个文件的大小
     uint64_t sSum;//8字节 每个数据包的和校验
 } PacketHeader;
 
@@ -115,13 +115,16 @@ uint64_t calculate_checksum(const char* data, size_t len) {
 //文本处理
 void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
     //uint32_t len = header.filename_len;
+    //创建缓冲区
     char buffer[BUFFER_SIZE];
     if (header.datalen >= BUFFER_SIZE) {
         fprintf(stderr, "文本消息过长\n");
         return;
     }
+    //接受文本数据到缓冲区上
     ssize_t bytes_read = recv(client_fd, buffer, header.datalen, MSG_WAITALL);
     //MSG_WAITALL 告诉系统尽可能等待，直到读取到指定数量的字节
+    //如果接受不完整报错
     if (bytes_read != header.datalen) {
         fprintf(stderr, "文本消息接收不完整\n");
         return;
